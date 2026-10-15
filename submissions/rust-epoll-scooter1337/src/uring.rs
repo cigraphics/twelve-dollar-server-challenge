@@ -19,7 +19,7 @@ use std::{
 
 const MAX_WORKERS: usize = 8;
 const TARGET_SLOTS: usize = MAX_WORKERS * 65535;
-const NBUFS: usize = 1024;
+const NBUFS: usize = 4096;
 const BUFSIZE: usize = 2048;
 const INPUT_LIMIT: usize = 1_114_112;
 const OUTPUT_HIGH: usize = 65536;
@@ -37,7 +37,8 @@ const PAUSED: u32 = 32;
 const DIRTY: u32 = 64;
 const CONTINUED: u32 = 128;
 const READY: u32 = 256;
-const INDEX_SHIFT: u32 = 10;
+const REARM: u32 = 1024;
+const INDEX_SHIFT: u32 = 11;
 const FLAG_MASK: u32 = (1 << INDEX_SHIFT) - 1;
 
 #[derive(Clone, Copy)]
@@ -184,6 +185,60 @@ struct Pending {
     count: u32,
     interim: bool,
 }
+impl Pending {
+    #[cold]
+    fn rollback(&self, output: &mut Buffer, close: bool, body: &[u8]) {
+        // A failed in-flight send can discard queued bytes later in this same
+        // CQ batch. That connection is closing and has no replies to rewrite.
+        if output.len < self.start
+            || (output.len == self.start && (self.count != 0 || self.interim))
+        {
+            return;
+        }
+        // Recover interim positions from our own encoded responses only after a
+        // failed commit. Successful batches retain their existing metadata and
+        // allocation behavior, including multiple Continue responses per batch.
+        let mut interims = Vec::new();
+        if self.interim {
+            let mut bytes = &output.bytes()[self.start as usize..];
+            let mut count = 0;
+            while !bytes.is_empty() {
+                if let Some(rest) = bytes.strip_prefix(b"HTTP/1.1 100 Continue\r\n\r\n") {
+                    interims.push(count);
+                    bytes = rest;
+                    continue;
+                }
+                let mut headers = [httparse::EMPTY_HEADER; 3];
+                let mut reply = httparse::Response::new(&mut headers);
+                let httparse::Status::Complete(end) = reply.parse(bytes).expect("encoded response")
+                else {
+                    unreachable!("incomplete encoded response");
+                };
+                let length = reply
+                    .headers
+                    .iter()
+                    .find(|h| h.name == "Content-Length")
+                    .and_then(|h| std::str::from_utf8(h.value).ok())
+                    .and_then(|n| n.parse::<usize>().ok())
+                    .expect("encoded response length");
+                bytes = &bytes[end + length..];
+                count += 1;
+            }
+            assert_eq!(count, self.count);
+        }
+        output.len = self.start;
+        let mut interims = interims.into_iter().peekable();
+        for i in 0..=self.count {
+            while interims.peek() == Some(&i) {
+                output.extend(b"HTTP/1.1 100 Continue\r\n\r\n");
+                interims.next();
+            }
+            if i < self.count {
+                response(500, body, close && i + 1 == self.count, output);
+            }
+        }
+    }
+}
 struct Worker {
     // Destroy the ring before any of the allocations referenced by its entries.
     ring: IoUring,
@@ -191,6 +246,7 @@ struct Worker {
     buf_ring: Option<Mapping>,
     tail: u16,
     returned: Vec<u16>,
+    rearm: VecDeque<(usize, u32)>,
     clients: Vec<Client>,
     slots: usize,
     reserve: usize,
@@ -213,11 +269,11 @@ fn tag(op: u64, fd: usize, generation: u32) -> u64 {
 impl Worker {
     fn new(listener: i32, slots: usize, tuning: Tuning) -> io::Result<Self> {
         let ring = IoUring::builder()
-            .setup_cqsize(8192)
+            .setup_cqsize(16384)
             .setup_coop_taskrun()
             .setup_single_issuer()
             .setup_defer_taskrun()
-            .build(1024)?;
+            .build(4096)?;
         ring.submitter().register_files_sparse(slots as u32)?;
         let recv_memory = Mapping::new(NBUFS * BUFSIZE)?;
         let descriptors = Mapping::new(NBUFS * std::mem::size_of::<types::BufRingEntry>())?;
@@ -239,6 +295,7 @@ impl Worker {
             buf_ring: registered.then_some(descriptors),
             tail: 0,
             returned: Vec::with_capacity(NBUFS),
+            rearm: VecDeque::new(),
             clients: Vec::new(),
             slots,
             reserve: 1024.min(slots / 8),
@@ -247,7 +304,7 @@ impl Worker {
             accept_generation: 0,
             open: 0,
             ready: VecDeque::new(),
-            completions: Vec::with_capacity(8192),
+            completions: Vec::with_capacity(16384),
             pending: Vec::with_capacity(1024),
             pool: Vec::with_capacity(256),
             body: Vec::with_capacity(16384),
@@ -292,6 +349,12 @@ impl Worker {
             if unsafe { self.ring.submission().push(&entry) }.is_ok() {
                 break;
             }
+            // Return completed buffers before submitting any rearmed receives.
+            // The legacy provider queues SQEs itself, so it is published by the
+            // outer completion loop rather than recursively from here.
+            if self.buf_ring.is_some() {
+                self.publish_buffers();
+            }
             self.ring.submit().expect("submit full I/O queue");
         }
     }
@@ -318,7 +381,7 @@ impl Worker {
             .build()
             .user_data(tag(RECV, fd, self.clients[fd].generation));
         self.queue(e);
-        self.clients[fd].state |= RECEIVING;
+        self.clients[fd].state = (self.clients[fd].state | RECEIVING) & !REARM;
     }
     fn send(&mut self, fd: usize) {
         let c = &mut self.clients[fd];
@@ -620,8 +683,16 @@ impl Worker {
                 self.close(fd);
             }
             let c = &self.clients[fd];
-            if c.state & (RECEIVING | CLOSING | PAUSED) == 0 && c.state & LIVE != 0 {
-                self.recv(fd);
+            if c.state & (RECEIVING | CLOSING | PAUSED | REARM) == 0 && c.state & LIVE != 0 {
+                if result == -libc::ENOBUFS {
+                    // A depleted receive joins a bounded retry pass after buffers
+                    // and responses have been returned. Retrying every failure
+                    // during CQ processing can generate another failure storm.
+                    self.clients[fd].state |= REARM;
+                    self.rearm.push_back((fd, generation));
+                } else {
+                    self.recv(fd);
+                }
             }
         }
         if let Some(bid) = selected {
@@ -679,18 +750,7 @@ impl Worker {
                 if c.generation != p.generation || c.state & LIVE == 0 {
                     continue;
                 }
-                c.output.len = p.start;
-                for i in 0..p.count {
-                    response(
-                        500,
-                        &self.body,
-                        c.state & CLOSING != 0 && i + 1 == p.count,
-                        &mut c.output,
-                    );
-                }
-                if p.interim {
-                    c.output.extend(b"HTTP/1.1 100 Continue\r\n\r\n");
-                }
+                p.rollback(&mut c.output, c.state & CLOSING != 0, &self.body);
             }
         }
         for i in 0..self.pending.len() {
@@ -717,7 +777,7 @@ impl Worker {
         let mut last_count = 0;
         let mut sweep = 0;
         loop {
-            let timeout = if last_count >= 4 {
+            let timeout = if last_count >= 4 || !self.rearm.is_empty() {
                 types::Timespec::new().nsec(self.tuning.wait_us * 1000)
             } else {
                 types::Timespec::new().sec(2)
@@ -778,6 +838,29 @@ impl Worker {
             self.flush(committed);
             app.db.checkpoint();
             drop(app);
+            if !self.rearm.is_empty() {
+                let returned = self
+                    .completions
+                    .iter()
+                    .filter(|(_, _, flags)| cqueue::buffer_select(*flags).is_some())
+                    .count();
+                // Bound retries by progress, with a small allowance to restart
+                // an otherwise idle ring. Unvisited clients remain queued once.
+                let budget = returned.max(32).min(NBUFS / 2);
+                for _ in 0..budget {
+                    let Some((fd, generation)) = self.rearm.pop_front() else {
+                        break;
+                    };
+                    let c = &mut self.clients[fd];
+                    if c.generation != generation || c.state & REARM == 0 {
+                        continue;
+                    }
+                    c.state &= !REARM;
+                    if c.state & (LIVE | RECEIVING | CLOSING | PAUSED) == LIVE {
+                        self.recv(fd);
+                    }
+                }
+            }
             if !self.accepting && self.slots - self.open >= self.reserve * 2 {
                 self.accept();
             }
@@ -913,3 +996,7 @@ pub fn run(address: &str, app: App, tuning: Tuning) -> io::Result<()> {
         std::thread::park_timeout(Duration::from_secs(3600));
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/support/uring_responses.rs"]
+mod response_tests;
